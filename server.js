@@ -680,30 +680,123 @@ class GatewayServer {
   }
 
   async handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket, responseHeader, log) {
+    // DNS (UDP/53) is resolved through Cloudflare DNS-over-HTTPS.
+    // Other UDP destinations keep the existing direct UDP behavior.
+    if (Number(targetPort) === 53) {
+      try {
+        let payload = Buffer.from(dataChunk);
+        let lengthPrefixed = false;
+
+        // VLESS/Trojan UDP payloads commonly carry a 2-byte length prefix.
+        // Strip it only when it exactly matches the remaining DNS message.
+        if (payload.length >= 14 && payload.readUInt16BE(0) === payload.length - 2) {
+          payload = payload.subarray(2);
+          lengthPrefixed = true;
+        }
+
+        if (payload.length < 12) {
+          throw new Error('DNS packet is too short');
+        }
+
+        const resp = await fetch('https://1.1.1.1/dns-query', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/dns-message',
+            'accept': 'application/dns-message'
+          },
+          body: payload,
+          signal: AbortSignal.timeout(10000)
+        });
+
+        if (!resp.ok) {
+          throw new Error(`Cloudflare DoH returned HTTP ${resp.status}`);
+        }
+
+        const dnsReply = Buffer.from(await resp.arrayBuffer());
+        if (dnsReply.length < 12) {
+          throw new Error('Cloudflare DoH returned an invalid DNS response');
+        }
+
+        let output = dnsReply;
+        if (lengthPrefixed) {
+          const size = Buffer.allocUnsafe(2);
+          size.writeUInt16BE(dnsReply.length);
+          output = Buffer.concat([size, dnsReply]);
+        }
+
+        if (webSocket.readyState === WebSocket.OPEN) {
+          let packet = output;
+          if (responseHeader) {
+            packet = Buffer.concat([Buffer.from(responseHeader), packet]);
+          }
+          this.totalTX += packet.length;
+          webSocket.send(packet);
+          this.totalRX += payload.length;
+          log(`Cloudflare DoH success, query=${payload.length}B response=${dnsReply.length}B`);
+        }
+      } catch (e) {
+        console.error(`Cloudflare DoH error: ${e.message}`);
+        log(`Cloudflare DoH error: ${e.message}`);
+        if (webSocket.readyState === WebSocket.OPEN) {
+          webSocket.close(1011, 'DNS resolution failed');
+        }
+      }
+      return;
+    }
+
+    // Preserve direct UDP forwarding for non-DNS traffic.
     return new Promise((resolve) => {
       try {
         let header = responseHeader;
         const key = `${targetAddress}:${targetPort}:${Date.now()}`;
         const sock = dgram.createSocket('udp4');
         this.activeUDPConnections.set(key, { socket: sock, webSocket });
-        sock.on('error', (e) => { try{sock.close()}catch(_){} this.activeUDPConnections.delete(key); });
-        sock.send(dataChunk, targetPort, targetAddress, (e) => { if(e){ try{sock.close()}catch(_){} this.activeUDPConnections.delete(key); } });
+        sock.on('error', (e) => {
+          try { sock.close(); } catch (_) {}
+          this.activeUDPConnections.delete(key);
+          console.error(`UDP error: ${e.message}`);
+          resolve();
+        });
         sock.on('message', (msg) => {
           this.totalRX += msg.length;
           if (webSocket.readyState === WebSocket.OPEN) {
+            let packet = msg;
             if (header) {
-              const buf = Buffer.from(header);
-              this.totalTX += buf.length;
-              webSocket.send(Buffer.concat([buf, msg]));
+              packet = Buffer.concat([Buffer.from(header), packet]);
               header = null;
             }
-            else webSocket.send(msg);
+            this.totalTX += packet.length;
+            webSocket.send(packet);
           }
         });
-        sock.on('close', () => this.activeUDPConnections.delete(key));
-        let t = setTimeout(() => { try{sock.close()}catch(_){} this.activeUDPConnections.delete(key); }, 30000);
-        sock.on('message', () => { clearTimeout(t); t = setTimeout(() => { try{sock.close()}catch(_){} this.activeUDPConnections.delete(key); }, 30000); });
-      } catch(e) { console.error(`UDP error: ${e.message}`); }
+        sock.send(dataChunk, targetPort, targetAddress, (e) => {
+          if (e) {
+            try { sock.close(); } catch (_) {}
+            this.activeUDPConnections.delete(key);
+            resolve();
+          }
+        });
+        sock.on('close', () => {
+          this.activeUDPConnections.delete(key);
+          resolve();
+        });
+        let t = setTimeout(() => {
+          try { sock.close(); } catch (_) {}
+          this.activeUDPConnections.delete(key);
+          resolve();
+        }, 30000);
+        sock.on('message', () => {
+          clearTimeout(t);
+          t = setTimeout(() => {
+            try { sock.close(); } catch (_) {}
+            this.activeUDPConnections.delete(key);
+            resolve();
+          }, 30000);
+        });
+      } catch (e) {
+        console.error(`UDP error: ${e.message}`);
+        resolve();
+      }
     });
   }
 
